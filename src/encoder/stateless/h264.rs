@@ -27,6 +27,8 @@ use crate::Resolution;
 
 mod predictor;
 
+#[cfg(test)]
+pub(crate) mod dummy;
 #[cfg(feature = "vaapi")]
 pub mod vaapi;
 
@@ -368,5 +370,103 @@ where
         // Poll on output queue without blocking and try to dueue from coded queue
         self.poll_pending(BlockingMode::NonBlocking)?;
         Ok(self.coded_queue.pop_front())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+    use crate::codec::h264::nalu::Nalu;
+    use crate::codec::h264::parser::NaluHeader;
+    use crate::codec::h264::parser::NaluType;
+    use crate::codec::h264::parser::Parser;
+    use crate::encoder::stateless::h264::dummy::DUMMY_TS_SEI_UUID;
+    use crate::encoder::stateless::simple_encode_loop;
+    use crate::encoder::stateless::tests::DummyFrameProducer;
+    use crate::FrameLayout;
+    use crate::PlaneLayout;
+
+    #[test]
+    fn test_low_delay_dummy() {
+        const WIDTH: usize = 1;
+        const HEIGHT: usize = 1;
+        const FRAME_COUNT: u64 = 10000;
+
+        let _ = env_logger::try_init();
+
+        let config = EncoderConfig {
+            profile: Profile::Main,
+            framerate: 30,
+            resolution: Resolution {
+                width: WIDTH as u32,
+                height: HEIGHT as u32,
+            },
+            ..Default::default()
+        };
+
+        let frame_layout = FrameLayout {
+            format: (b"NV12".into(), 0),
+            size: Resolution {
+                width: WIDTH as u32,
+                height: HEIGHT as u32,
+            },
+            planes: vec![
+                PlaneLayout {
+                    buffer_index: 0,
+                    offset: 0,
+                    stride: WIDTH,
+                },
+                PlaneLayout {
+                    buffer_index: 0,
+                    offset: WIDTH * HEIGHT,
+                    stride: WIDTH,
+                },
+            ],
+        };
+
+        let mut encoder = StatelessEncoder::new_dummy(config, BlockingMode::Blocking).unwrap();
+
+        let mut producer = DummyFrameProducer::new(FRAME_COUNT, frame_layout);
+        let bitstream = simple_encode_loop(&mut encoder, &mut producer).unwrap();
+        let mut cursor = Cursor::new(&bitstream[..]);
+
+        let mut frame_counter: u64 = 0;
+
+        while let Ok(nalu) = Nalu::<NaluHeader>::next(&mut cursor) {
+            match nalu.header.type_ {
+                NaluType::Sei => {
+                    let sei = Parser::parse_sei(&nalu).unwrap();
+
+                    for message in sei.messages {
+                        if message.payload_type != 0x05 {
+                            continue;
+                        }
+
+                        let uuid = &message.payload[..16];
+                        assert_eq!(DUMMY_TS_SEI_UUID, uuid);
+
+                        let expected_payload = frame_counter.to_le_bytes();
+                        assert_eq!(&expected_payload, &message.payload[16..]);
+
+                        frame_counter += 1;
+                    }
+                }
+                type_ => {
+                    assert!(matches!(type_, NaluType::Sps | NaluType::Pps))
+                }
+            }
+        }
+
+        assert_eq!(frame_counter, FRAME_COUNT);
+
+        const WRITE_TO_FILE: bool = true;
+        if WRITE_TO_FILE {
+            use std::io::Write;
+            let mut out = std::fs::File::create("test_low_delay_dummy.264").unwrap();
+            out.write_all(&bitstream).unwrap();
+            out.flush().unwrap();
+        }
     }
 }

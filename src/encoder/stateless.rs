@@ -191,3 +191,50 @@ where
 
     Ok(bitstream)
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::encoder::FrameMetadata;
+    use crate::FrameLayout;
+    use crate::Resolution;
+
+    pub struct DummyFrameProducer {
+        counter: u64,
+        limit: u64,
+        frame_layout: FrameLayout,
+    }
+
+    impl DummyFrameProducer {
+        pub fn new(limit: u64, frame_layout: FrameLayout) -> Self {
+            Self {
+                limit,
+                counter: 0,
+                frame_layout,
+            }
+        }
+    }
+
+    impl Iterator for DummyFrameProducer {
+        type Item = (FrameMetadata, ());
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.counter >= self.limit {
+                return None;
+            }
+
+            let meta = FrameMetadata {
+                display_resolution: Resolution {
+                    width: self.frame_layout.size.width,
+                    height: self.frame_layout.size.width,
+                },
+                layout: self.frame_layout.clone(),
+                force_keyframe: false,
+                timestamp: self.counter,
+            };
+
+            self.counter += 1;
+
+            Some((meta, ()))
+        }
+    }
+}

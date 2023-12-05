@@ -16,6 +16,9 @@ use crate::codec::h264::parser::DEFAULT_4X4_INTRA;
 use crate::codec::h264::parser::DEFAULT_8X8_INTER;
 use crate::codec::h264::parser::DEFAULT_8X8_INTRA;
 
+use super::parser::Sei;
+use super::parser::SeiMessage;
+
 mod private {
     pub trait NaluStruct {}
 }
@@ -23,6 +26,8 @@ mod private {
 impl private::NaluStruct for Sps {}
 
 impl private::NaluStruct for Pps {}
+
+impl private::NaluStruct for Sei {}
 
 #[derive(Error, Debug)]
 pub enum SynthesizerError {
@@ -118,6 +123,29 @@ impl<N: private::NaluStruct, W: Write> Synthesizer<'_, N, W> {
             11 => &DEFAULT_8X8_INTER[..],
             _ => unreachable!(),
         }
+    }
+
+    fn sei_message(&mut self, message: &SeiMessage) -> SynthesizerResult<()> {
+        let mut type_ = message.payload_type;
+        while type_ >= 0xff {
+            self.f(8, 0xffu32)?;
+            type_ -= 0xff;
+        }
+        self.f(8, type_)?;
+
+        let mut size = message.payload.len();
+        while size >= 0xff {
+            self.f(8, 0xffu32)?;
+            size -= 0xff;
+        }
+        // SAFETY: size < 255
+        self.f(8, size as u32)?;
+
+        for byte in &message.payload {
+            self.f(8, *byte)?;
+        }
+
+        Ok(())
     }
 
     fn rbsp_trailing_bits(&mut self) -> SynthesizerResult<()> {
@@ -440,6 +468,28 @@ impl<'n, W: Write> Synthesizer<'n, Pps, W> {
         self.se(self.nalu.second_chroma_qp_index_offset)?;
 
         Ok(())
+    }
+}
+
+impl<'n, W: Write> Synthesizer<'n, Sei, W> {
+    pub fn synthesize(
+        ref_idc: u8,
+        sei: &'n Sei,
+        writer: &'n mut W,
+        ep_enabled: bool,
+    ) -> SynthesizerResult<()> {
+        let mut s = Self {
+            writer: NaluWriter::<'n, W>::new(writer, ep_enabled),
+            nalu: sei,
+        };
+        // TODO test me
+
+        s.writer.write_header(ref_idc, NaluType::Sei as u8)?;
+        for message in &sei.messages {
+            s.sei_message(message)?;
+        }
+
+        s.rbsp_trailing_bits()
     }
 }
 

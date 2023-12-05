@@ -1514,6 +1514,17 @@ impl PpsBuilder {
     }
 }
 
+#[derive(Debug)]
+pub struct SeiMessage {
+    pub payload_type: u32,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub struct Sei {
+    pub messages: Vec<SeiMessage>,
+}
+
 #[derive(Debug, Default)]
 pub struct Parser {
     active_spses: BTreeMap<u8, Rc<Sps>>,
@@ -2483,6 +2494,69 @@ impl Parser {
         header.n_emulation_prevention_bytes = epb;
 
         Ok(Slice { header, nalu })
+    }
+
+    fn parse_sei_message(r: &mut NaluReader<'_>) -> anyhow::Result<SeiMessage> {
+        let mut payload_type: u32 = 0;
+        // Read up to 32 bytes, to avoid dead locking. This limits the payload
+        // type to 32 * 255 = 8160
+        for _ in 0..32 {
+            let byte = r.read_bits(8)?;
+            payload_type = payload_type
+                .checked_add(byte)
+                .ok_or(anyhow!("Sei message type too big"))?;
+
+            if byte != 0xff {
+                break;
+            }
+        }
+
+        let mut payload_size: usize = 0;
+        // Read up to 32 bytes, to avoid dead locking. This limits the payload
+        // size to 64 * 255 = 16320
+        for _ in 0..64 {
+            let byte = r.read_bits(8)?;
+            payload_size = payload_size
+                .checked_add(byte)
+                .ok_or(anyhow!("Sei message type too big"))?;
+
+            if byte != 0xff {
+                break;
+            }
+        }
+
+        let mut payload = Vec::with_capacity(payload_size);
+
+        for _ in 0..payload_size {
+            payload.push(r.read_bits(8)?);
+        }
+
+        Ok(SeiMessage {
+            payload_type,
+            payload,
+        })
+    }
+
+    // TODO test me
+    pub fn parse_sei(nalu: &'_ Nalu<'_>) -> anyhow::Result<Sei> {
+        if !matches!(nalu.header.type_, NaluType::Sei) {
+            return Err(anyhow!(
+                "Invalid NALU type: {:?} is not a SEI",
+                nalu.header.type_
+            ));
+        }
+        let mut messages = Vec::new();
+
+        let data = nalu.as_ref();
+        let mut r = NaluReader::new(&data[nalu.header.len()..]);
+
+        let mut has_more_rsbp_data = true;
+        while has_more_rsbp_data {
+            messages.push(Self::parse_sei_message(&mut r)?);
+            has_more_rsbp_data = r.has_more_rsbp_data();
+        }
+
+        Ok(Sei { messages })
     }
 
     pub fn get_sps(&self, sps_id: u8) -> Option<&Rc<Sps>> {

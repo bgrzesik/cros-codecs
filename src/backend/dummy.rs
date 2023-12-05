@@ -6,3 +6,4 @@
 //! run so we can test it in isolation.
 
 pub(crate) mod decoder;
+pub(crate) mod encoder;
