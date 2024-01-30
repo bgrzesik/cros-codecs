@@ -11,6 +11,7 @@ use crate::codec::h264::parser::Profile;
 use crate::codec::h264::parser::SliceHeader;
 use crate::codec::h264::parser::Sps;
 use crate::encoder::stateless::h264::predictor::LowDelay;
+use crate::encoder::stateless::h264::predictor::GroupOfPictures;
 use crate::encoder::stateless::h264::predictor::PredictionStructure;
 use crate::encoder::stateless::h264::predictor::Predictor;
 use crate::encoder::stateless::h264::predictor::PredictorVerdict;
@@ -82,7 +83,7 @@ pub enum IsReference {
     LongTerm,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DpbEntryMeta {
     /// Picture order count
     poc: u16,
@@ -248,6 +249,7 @@ where
     fn new(backend: B, config: EncoderConfig, mode: BlockingMode) -> EncodeResult<Self> {
         let predictor: Box<dyn Predictor<_, _>> = match config.pred_structure {
             PredictionStructure::LowDelay { .. } => Box::new(LowDelay::new(config)),
+            PredictionStructure::GroupOfPictures { .. } => Box::new(GroupOfPictures::new(config)),
         };
 
         Ok(Self {

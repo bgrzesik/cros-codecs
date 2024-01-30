@@ -32,7 +32,15 @@ pub enum PredictionStructure {
     /// the stream and every time when [`limit`] frames are reached. IDR is built with SPS, PPS
     /// and frame with single I slice. Following IDR frames are single P slice frames referencing
     /// maximum [`tail`] previous frames.
-    LowDelay { tail: u16, limit: u16 },
+    LowDelay {
+        tail: u16,
+        limit: u16,
+    },
+
+    GroupOfPictures {
+        size: u16,
+        limit: u16,
+    },
 }
 
 /// The result of the predictor operations.
@@ -104,6 +112,7 @@ impl<P, R> LowDelay<P, R> {
         let config = Rc::new(config);
         let (tail, limit) = match config.pred_structure {
             PredictionStructure::LowDelay { tail, limit } => (tail, limit),
+            _ => panic!(),
         };
 
         Self {
@@ -331,5 +340,344 @@ impl<P, R> Predictor<P, R> for LowDelay<P, R> {
     fn drain(&mut self) -> EncodeResult<Vec<BackendRequest<P, R>>> {
         // [`LowDelay`] will not hold any frames, therefore the drain function shall never be called.
         Err(EncodeError::InvalidInternalState)
+    }
+}
+
+pub(super) struct GroupOfPictures<P, R> {
+    /// Current frame in the sequence counter
+    poc_counter: u16,
+    // frame_num counter
+    frame_counter: u32,
+
+    /// Limit of frames in the sequence
+    limit: u16,
+    /// The number of B frames in GOP
+    size: u16,
+
+    /// Queue of pending frames to be encoded
+    pending: VecDeque<(P, FrameMetadata)>,
+
+    /// Buffer of future B frames. The contents of this buffers will be drained
+    /// after both l0 and l1 references are reconstructed.
+    future_b_frames: VecDeque<(P, FrameMetadata)>,
+
+    // The left frame of the GOP, that will be l0 reference for b frames
+    l0_ref: Option<Rc<DpbEntry<R>>>,
+    // Metadata of the future l0 reference frame
+    idr_ref_pending: Option<DpbEntryMeta>,
+    // Metadata of the future l1 reference frame
+    l1_ref_pending: Option<DpbEntryMeta>,
+
+    /// Current sequence SPS
+    sps: Option<Rc<Sps>>,
+    /// Current sequence PPS
+    pps: Option<Rc<Pps>>,
+
+    /// Encoder config
+    config: Rc<EncoderConfig>,
+}
+
+impl<P, R> GroupOfPictures<P, R> {
+    pub(super) fn new(config: EncoderConfig) -> Self {
+        let config = Rc::new(config);
+        let (size, limit) = match config.pred_structure {
+            PredictionStructure::GroupOfPictures { size, limit } => (size, limit),
+            _ => panic!(),
+        };
+
+        Self {
+            poc_counter: 0,
+            frame_counter: 0,
+            limit,
+            size,
+
+            pending: Default::default(),
+            future_b_frames: Default::default(),
+
+            l0_ref: None,
+            idr_ref_pending: None,
+            l1_ref_pending: None,
+
+            sps: None,
+            pps: None,
+            config,
+        }
+    }
+}
+
+impl<P, R> GroupOfPictures<P, R> {
+    fn new_sequence(&mut self) {
+        trace!("beginning new sequence");
+        let mut sps = SpsBuilder::new()
+            .seq_parameter_set_id(0)
+            .profile_idc(self.config.profile);
+
+        // H.264 Table 6-1
+        sps = match self.config.profile {
+            // 4:2:2 subsampling
+            Profile::High422P => sps.chroma_format_idc(2),
+            // 4:2:0 subsampling
+            _ => sps.chroma_format_idc(1),
+        };
+
+        let sps = sps
+            .level_idc(self.config.level)
+            .max_frame_num(self.limit as u32)
+            .pic_order_cnt_type(0)
+            .max_pic_order_cnt_lsb(self.limit as u32 * 2)
+            .max_num_ref_frames(self.size as u32 + 1)
+            .frame_mbs_only_flag(true)
+            // H264 spec Table A-4
+            .direct_8x8_inference_flag(self.config.level >= Level::L3)
+            .resolution(self.config.resolution.width, self.config.resolution.height)
+            .bit_depth_luma(8)
+            .bit_depth_chroma(8)
+            .aspect_ratio(1, 1)
+            .timing_info(1, self.config.framerate * 2, false)
+            .build();
+
+        let pps = PpsBuilder::new(Rc::clone(&sps))
+            .pic_parameter_set_id(0)
+            .pic_init_qp(self.config.default_qp)
+            .deblocking_filter_control_present_flag(true)
+            .num_ref_idx_l0_default_active(1)
+            .num_ref_idx_l1_default_active(1)
+            .build();
+
+        self.frame_counter = 0;
+        self.poc_counter = 0;
+        self.l0_ref = None;
+        self.idr_ref_pending = None;
+        self.l1_ref_pending = None;
+        self.sps = Some(sps);
+        self.pps = Some(pps);
+    }
+
+    fn request_idr(
+        &mut self,
+        input: P,
+        input_meta: FrameMetadata,
+    ) -> EncodeResult<BackendRequest<P, R>> {
+        // Begin new sequence and start with I frame and no references.
+        self.new_sequence();
+
+        // SAFETY: SPS and PPS were initialized by [`Self::new_sequence()`]
+        let sps = self.sps.clone().unwrap();
+        let pps = self.pps.clone().unwrap();
+
+        let dpb_meta = DpbEntryMeta {
+            poc: self.poc_counter * 2,
+            frame_num: self.frame_counter,
+            is_reference: IsReference::ShortTerm,
+        };
+
+        let header = SliceHeaderBuilder::new(&pps)
+            .slice_type(SliceType::I)
+            .first_mb_in_slice(0)
+            .pic_order_cnt_lsb(dpb_meta.poc)
+            .build();
+
+        self.poc_counter += 1;
+        self.frame_counter += 1;
+
+        let mut headers = vec![];
+        Synthesizer::<Sps, Vec<u8>>::synthesize(3, &sps, &mut headers, true)?;
+        Synthesizer::<Pps, Vec<u8>>::synthesize(3, &pps, &mut headers, true)?;
+
+        let num_macroblocks =
+            ((sps.pic_width_in_mbs_minus1 + 1) * (sps.pic_height_in_map_units_minus1 + 1)) as usize;
+
+        self.idr_ref_pending = Some(dpb_meta.clone());
+
+        Ok(BackendRequest {
+            sps,
+            pps,
+            header,
+            input,
+            input_meta,
+            dpb_meta,
+            // This frame is IDR, therefore it has no references
+            ref_list_0: vec![],
+            ref_list_1: vec![],
+
+            num_macroblocks,
+
+            is_idr: true,
+            config: Rc::clone(&self.config),
+
+            coded_output: headers,
+        })
+    }
+
+    fn request_p(&mut self, input: P, input_meta: FrameMetadata) -> BackendRequest<P, R> {
+        // SAFETY: SPS and PPS were initialized during IDR request
+        let sps = self.sps.clone().unwrap();
+        let pps = self.pps.clone().unwrap();
+
+        let dpb_meta = DpbEntryMeta {
+            poc: (self.poc_counter + self.size) * 2,
+            frame_num: self.frame_counter,
+            is_reference: IsReference::ShortTerm,
+        };
+
+        let header = SliceHeaderBuilder::new(&pps)
+            .slice_type(SliceType::P)
+            .first_mb_in_slice(0)
+            .pic_order_cnt_lsb(dpb_meta.poc)
+            .build();
+
+        let num_macroblocks =
+            ((sps.pic_width_in_mbs_minus1 + 1) * (sps.pic_height_in_map_units_minus1 + 1)) as usize;
+
+        self.l1_ref_pending = Some(dpb_meta.clone());
+
+        let request = BackendRequest {
+            sps,
+            pps,
+            header,
+            input,
+            input_meta,
+            dpb_meta,
+            ref_list_0: vec![Rc::clone(self.l0_ref.as_ref().unwrap())],
+            ref_list_1: vec![], // No future references
+
+            num_macroblocks,
+
+            is_idr: false,
+            config: Rc::clone(&self.config),
+
+            coded_output: vec![],
+        };
+
+        self.poc_counter += 1;
+        self.frame_counter += 1;
+
+        request
+    }
+
+    fn request_b(
+        &mut self,
+        input: P,
+        input_meta: FrameMetadata,
+        l1_ref: &Rc<DpbEntry<R>>,
+    ) -> BackendRequest<P, R> {
+        // SAFETY: SPS and PPS were initialized during IDR request
+        let sps = self.sps.clone().unwrap();
+        let pps = self.pps.clone().unwrap();
+
+        let dpb_meta = DpbEntryMeta {
+            poc: (self.poc_counter - 1) * 2,
+            frame_num: self.frame_counter,
+            is_reference: IsReference::No,
+        };
+
+        let header = SliceHeaderBuilder::new(&pps)
+            .slice_type(SliceType::B)
+            .first_mb_in_slice(0)
+            .pic_order_cnt_lsb(dpb_meta.poc)
+            .build();
+
+        let num_macroblocks =
+            ((sps.pic_width_in_mbs_minus1 + 1) * (sps.pic_height_in_map_units_minus1 + 1)) as usize;
+
+        let request = BackendRequest {
+            sps,
+            pps,
+            header,
+            input,
+            input_meta,
+            dpb_meta,
+            ref_list_0: vec![Rc::clone(self.l0_ref.as_ref().unwrap())],
+            ref_list_1: vec![Rc::clone(l1_ref)],
+
+            num_macroblocks,
+
+            is_idr: false,
+            config: Rc::clone(&self.config),
+
+            coded_output: vec![],
+        };
+
+        self.poc_counter += 1;
+
+        request
+    }
+
+    fn next_i_p_frames(&mut self, requests: &mut Vec<BackendRequest<P, R>>) -> EncodeResult<()> {
+        while let Some((input, frame_metadata)) = self.pending.pop_front() {
+            if self.l0_ref.is_none() && self.idr_ref_pending.is_none() {
+                requests.push(self.request_idr(input, frame_metadata)?);
+            } else if self.future_b_frames.len() < self.size as usize {
+                self.future_b_frames.push_back((input, frame_metadata));
+            } else if self.l1_ref_pending.is_none() && self.l0_ref.is_some() {
+                requests.push(self.request_p(input, frame_metadata));
+            } else {
+                self.pending.push_front((input, frame_metadata));
+                break;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl<P, R> Predictor<P, R> for GroupOfPictures<P, R> {
+    fn new_frame(
+        &mut self,
+        input: P,
+        frame_metadata: FrameMetadata,
+    ) -> EncodeResult<PredictorVerdict<P, R>> {
+        self.pending.push_back((input, frame_metadata));
+
+        let mut requests = vec![];
+        self.next_i_p_frames(&mut requests)?;
+
+        if requests.is_empty() {
+            return Ok(PredictorVerdict::NoOperation);
+        }
+
+        Ok(PredictorVerdict::Request { requests })
+    }
+
+    fn reconstructed(&mut self, recon: DpbEntry<R>) -> EncodeResult<PredictorVerdict<P, R>> {
+        let mut requests = vec![];
+
+        if self.idr_ref_pending.as_ref() == Some(&recon.meta) {
+            // It is the first reconstructed picture in the sequence (I),
+            // therefore using as l0 reference.
+            self.l0_ref = Some(Rc::new(recon));
+        } else if self.l1_ref_pending.as_ref() == Some(&recon.meta) {
+            let recon = Rc::new(recon);
+
+            while let Some((input, meta)) = self.future_b_frames.pop_front() {
+                requests.push(self.request_b(input, meta, &recon));
+            }
+
+            self.l0_ref = Some(recon);
+            self.l1_ref_pending = None;
+        }
+
+        self.next_i_p_frames(&mut requests)?;
+
+        if requests.is_empty() {
+            return Ok(PredictorVerdict::NoOperation);
+        }
+
+        Ok(PredictorVerdict::Request { requests })
+    }
+
+    fn drain(&mut self) -> EncodeResult<Vec<BackendRequest<P, R>>> {
+        if self.l1_ref_pending.is_some() {
+            return Err(EncodeError::InvalidInternalState);
+        }
+
+        let Some((input, meta)) = self.future_b_frames.pop_back() else {
+            return Err(EncodeError::InvalidInternalState);
+        };
+
+        let req = self.request_p(input, meta);
+        self.l1_ref_pending = Some(req.dpb_meta.clone());
+
+        Ok(vec![req])
     }
 }
